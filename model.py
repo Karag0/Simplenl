@@ -8,8 +8,9 @@ import numpy as np
 import random
 import math
 import warnings
+import os
 
-# Подавляем предупреждение о nested tensors
+# Подавляем конкретное предупреждение о nested tensors
 warnings.filterwarnings("ignore", message="The PyTorch API of nested tensors is in prototype stage")
 
 # Загрузка и подготовка данных
@@ -19,7 +20,7 @@ test_data = dataset['test']
 
 # Параметры
 VOCAB_SIZE = 10000
-BATCH_SIZE = 16  # batch size
+BATCH_SIZE = 16
 EMBEDDING_DIM = 128
 HIDDEN_DIM = 256
 LEARNING_RATE = 0.0001
@@ -27,6 +28,7 @@ NUM_EPOCHS = 5
 NUM_HEADS = 4
 NUM_LAYERS = 2
 DROPOUT = 0.1
+MODEL_PATH = 'transformer_sentiment_model.pth'
 
 # Построение словаря
 def build_vocab(texts, vocab_size):
@@ -40,7 +42,7 @@ def build_vocab(texts, vocab_size):
 
 vocab = build_vocab(train_data['text'], VOCAB_SIZE)
 
-# Векторизация текста
+# Векторизация текста без обрезки
 def text_to_vector(text, vocab):
     tokens = text.lower().split()
     vector = [vocab['<sos>']] + [vocab.get(token, vocab['<unk>']) for token in tokens] + [vocab['<eos>']]
@@ -164,30 +166,89 @@ train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, co
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, collate_fn=collate_fn)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = SimpleTransformerClassifier(
-    len(vocab), EMBEDDING_DIM, HIDDEN_DIM, NUM_HEADS, NUM_LAYERS, DROPOUT
-).to(device)
+
+# Функция для загрузки модели
+def load_model(model_path, device):
+    if os.path.exists(model_path):
+        print(f"Загружаем модель из {model_path}")
+        checkpoint = torch.load(model_path, map_location=device)
+        
+        # Создаем модель с теми же параметрами
+        model_params = checkpoint['model_params']
+        model = SimpleTransformerClassifier(
+            model_params['vocab_size'],
+            model_params['embedding_dim'],
+            model_params['hidden_dim'],
+            model_params['num_heads'],
+            model_params['num_layers'],
+            model_params['dropout']
+        ).to(device)
+        
+        # Загружаем веса
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Загружаем словарь
+        vocab = checkpoint['vocab']
+        
+        print("Модель успешно загружена!")
+        return model, vocab
+    else:
+        print(f"Модель {model_path} не найдена. Будет создана новая модель.")
+        return None, None
+
+# Пытаемся загрузить модель
+model, loaded_vocab = load_model(MODEL_PATH, device)
+
+# Если модель не загружена, создаем новую
+if model is None:
+    model = SimpleTransformerClassifier(
+        len(vocab), EMBEDDING_DIM, HIDDEN_DIM, NUM_HEADS, NUM_LAYERS, DROPOUT
+    ).to(device)
+else:
+    # Используем загруженный словарь
+    vocab = loaded_vocab
+
 criterion = nn.BCELoss()
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-# Обучение
-for epoch in range(NUM_EPOCHS):
-    model.train()
-    total_loss = 0
-    for texts, labels, padding_mask, _ in train_loader:
-        texts, labels = texts.to(device), labels.float().to(device)
-        padding_mask = padding_mask.to(device)
+# Обучение (только если модель не была загружена)
+if not os.path.exists(MODEL_PATH):
+    print("Начинаем обучение модели...")
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        total_loss = 0
+        for texts, labels, padding_mask, _ in train_loader:
+            texts, labels = texts.to(device), labels.float().to(device)
+            padding_mask = padding_mask.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(texts, padding_mask)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            optimizer.step()
+            
+            total_loss += loss.item()
         
-        optimizer.zero_grad()
-        outputs = model(texts, padding_mask)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        optimizer.step()
-        
-        total_loss += loss.item()
+        print(f'Epoch {epoch+1}, Loss: {total_loss/len(train_loader):.4f}')
     
-    print(f'Epoch {epoch+1}, Loss: {total_loss/len(train_loader):.4f}')
+    # Сохранение модели после обучения
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'vocab': vocab,
+        'model_params': {
+            'vocab_size': len(vocab),
+            'embedding_dim': EMBEDDING_DIM,
+            'hidden_dim': HIDDEN_DIM,
+            'num_heads': NUM_HEADS,
+            'num_layers': NUM_LAYERS,
+            'dropout': DROPOUT
+        }
+    }, MODEL_PATH)
+    
+    print(f"Модель сохранена как {MODEL_PATH}")
+else:
+    print("Пропускаем обучение, так как модель уже загружена")
 
 # Тестирование
 model.eval()
@@ -226,7 +287,7 @@ def predict_sentiment(text, model, vocab):
     output = model(tensor, padding_mask)
     pred = (output > 0.5).item()
     confidence = output.item() if pred else 1 - output.item()
-    return "Positive" if pred == 1 else "Negative", confidence
+    return "Positive" if pred == 1 else "Negative", confidence, output.item()
 
 # Вывод примеров предсказаний
 print("\nПримеры предсказаний:")
@@ -243,17 +304,18 @@ for i, idx in enumerate(indices):
     pred_label = "Positive" if all_predictions[idx] == 1 else "Negative"
     
     # Получаем уверенность модели для этого примера
-    _, confidence = predict_sentiment(text, model, vocab)
+    _, confidence, raw_score = predict_sentiment(text, model, vocab)
     
     print(f"Пример {i+1}:")
     print(f"Текст: {short_text}")
     print(f"Истинная метка: {true_label}")
     print(f"Предсказание: {pred_label}")
     print(f"Уверенность: {confidence:.2f}")
+    print(f"Сырой счет: {raw_score:.4f}")
     print("-" * 80)
 
 # Тест на пользовательских примерах
-print("\nТест на пользовательских примерах:") # Вы можете сюда вставить свои отзывы. 
+print("\nТест на пользовательских примерах:")
 test_examples = [
     "This movie was absolutely wonderful! I loved every minute of it.",
     "Terrible film. Waste of time and money.",
@@ -263,9 +325,9 @@ test_examples = [
 ]
 
 for i, example in enumerate(test_examples):
-    prediction, confidence = predict_sentiment(example, model, vocab)
+    prediction, confidence, raw_score = predict_sentiment(example, model, vocab)
     print(f"Пример {i+1}: '{example}'")
-    print(f"Предсказание: {prediction} (уверенность: {confidence:.2f})")
+    print(f"Предсказание: {prediction} (уверенность: {confidence:.2f}, счет: {raw_score:.4f})")
     print()
 
 # Анализ ошибок
@@ -290,18 +352,18 @@ if error_indices:
 else:
     print("Нет ошибок в предсказаниях!")
 
-# Сохранение модели
-torch.save({
-    'model_state_dict': model.state_dict(),
-    'vocab': vocab,
-    'model_params': {
-        'vocab_size': len(vocab),
-        'embedding_dim': EMBEDDING_DIM,
-        'hidden_dim': HIDDEN_DIM,
-        'num_heads': NUM_HEADS,
-        'num_layers': NUM_LAYERS,
-        'dropout': DROPOUT
-    }
-}, 'transformer_sentiment_model.pth')
+# Функция для интерактивного тестирования
+def interactive_test():
+    print("\nИнтерактивный режим. Введите 'quit' для выхода.")
+    while True:
+        text = input("\nВведите отзыв для анализа: ")
+        if text.lower() == 'quit':
+            break
+        
+        prediction, confidence, raw_score = predict_sentiment(text, model, vocab)
+        print(f"Результат: {prediction}")
+        print(f"Уверенность: {confidence:.2f}")
+        print(f"Сырой счет: {raw_score:.4f}")
 
-print("Модель сохранена как 'transformer_sentiment_model.pth'")
+# Запускаем интерактивный режим
+interactive_test()
