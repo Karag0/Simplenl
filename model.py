@@ -314,7 +314,7 @@ for i, idx in enumerate(indices):
     print(f"Сырой счет: {raw_score:.4f}")
     print("-" * 80)
 
-# Тест на пользовательских примерах
+# Тест на пользовательских примерах, замените примеры на свои
 print("\nТест на пользовательских примерах:")
 test_examples = [
     "This movie was absolutely wonderful! I loved every minute of it.",
